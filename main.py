@@ -115,7 +115,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def main():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
 
@@ -124,9 +124,9 @@ async def main():
     app.add_handler(CommandHandler("check", check))
 
     print("Бот запущен...")
-    await app.run_polling()
+    # В v20 run_polling СИНХРОННЫЙ и сам управляет event loop
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
