@@ -1,23 +1,31 @@
 import os
 import json
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    ChatMemberHandler,
+)
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ---------- НАСТРОЙКИ ЧЕРЕЗ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
+# ---------------- НАСТРОЙКИ ЧЕРЕЗ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")          # токен бота от @BotFather
 CHANNEL_ID = os.getenv("CHANNEL_ID")        # например "@amebelini"
 SHEET_ID = os.getenv("SHEET_ID")            # ID таблицы из URL
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # JSON ключ как строка
 
+# сколько времени после подписки действует промокод
+PROMO_WINDOW_HOURS = 24
 
-# ---------- ИНИЦИАЛИЗАЦИЯ GOOGLE SHEETS ----------
+
+# ---------------- РАБОТА С GOOGLE SHEETS ----------------
 
 def get_sheet():
     if not SERVICE_ACCOUNT_JSON:
@@ -26,33 +34,99 @@ def get_sheet():
     info = json.loads(SERVICE_ACCOUNT_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     client = gspread.authorize(creds)
 
     sh = client.open_by_key(SHEET_ID)
-    # возьмём первый лист
-    return sh.sheet1
+    sheet = sh.sheet1
+
+    # убеждаемся, что есть шапка нужного формата
+    header = sheet.row_values(1)
+    expected = ["user_id", "username", "code", "code_created_at", "joined_at"]
+    if header != expected:
+        sheet.clear()
+        sheet.append_row(expected)
+
+    return sheet
 
 
-def get_user_exists(sheet, user_id: int) -> bool:
+def find_user_row(sheet, user_id: int):
     """
-    Проверка, есть ли user_id уже в таблице.
-    Предполагаем, что user_id лежит в колонке A.
+    Ищем строку пользователя по user_id.
+    Возвращаем dict с данными или None.
     """
-    # Считываем всю колонку A, кроме заголовка
-    col = sheet.col_values(1)[1:]  # пропускаем шапку
-    return str(user_id) in col
+    values = sheet.get_all_values()  # список списков
+    if len(values) <= 1:
+        return None
+
+    # values[0] — заголовки
+    for idx, row in enumerate(values[1:], start=2):  # начинаем со 2-й строки (индекс 2)
+        if len(row) == 0:
+            continue
+        uid = row[0]
+        if uid == str(user_id):
+            # гарантируем нужную длину
+            while len(row) < 5:
+                row.append("")
+            return {
+                "row_index": idx,
+                "user_id": row[0],
+                "username": row[1],
+                "code": row[2],
+                "code_created_at": row[3],
+                "joined_at": row[4],
+            }
+
+    return None
 
 
-def append_user(sheet, user_id: int, username: str | None, code: str):
+def set_joined_at(sheet, user_id: int, username: str | None, joined_at_iso: str):
     """
-    Добавляем строку в таблицу:
-    user_id | username | code | created_at
+    Сохраняем факт подписки (joined_at).
+    Если пользователя нет в таблице — добавляем.
+    Если есть — НЕ трогаем (чтобы не переоткрывать окно акции).
     """
-    created_at = datetime.utcnow().isoformat()
-    sheet.append_row([str(user_id), username or "", code, created_at])
+    existing = find_user_row(sheet, user_id)
+    if existing:
+        # если уже есть joined_at, НЕ переписываем
+        if existing["joined_at"]:
+            return
+        row_index = existing["row_index"]
+        sheet.update_cell(row_index, 5, joined_at_iso)  # колонка E = joined_at
+    else:
+        sheet.append_row(
+            [
+                str(user_id),
+                username or "",
+                "",          # code
+                "",          # code_created_at
+                joined_at_iso,
+            ]
+        )
+
+
+def set_code(sheet, user_id: int, code: str, now_iso: str):
+    """
+    Записываем выданный код и время выдачи.
+    Предполагаем, что пользователь уже есть в таблице.
+    """
+    existing = find_user_row(sheet, user_id)
+    if not existing:
+        # на всякий случай добавим
+        sheet.append_row(
+            [str(user_id), "", code, now_iso, ""]
+        )
+    else:
+        row_index = existing["row_index"]
+        sheet.update_row(row_index, [
+            str(user_id),
+            existing["username"],
+            code,
+            now_iso,
+            existing["joined_at"],
+        ])
 
 
 def generate_code() -> str:
@@ -61,7 +135,36 @@ def generate_code() -> str:
     return f"MEBEL-{suffix}"
 
 
-# ---------- ХЭНДЛЕРЫ ТЕЛЕГРАМ-БОТА ----------
+# ---------------- ХЭНДЛЕРЫ ЧЛЕНСТВА В КАНАЛЕ ----------------
+
+async def track_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Отслеживаем новые подписки на канал.
+    Срабатывает, когда пользователь меняет статус в чате (канале).
+    """
+    chat_member_update = update.chat_member
+    chat = chat_member_update.chat
+
+    # работаем только с нашим каналом
+    # для каналов chat.id — отрицательный int, CHANNEL_ID у нас строкой '@name',
+    # поэтому просто проверяем тип канала
+    if chat.type != "channel":
+        return
+
+    old = chat_member_update.old_chat_member.status
+    new = chat_member_update.new_chat_member.status
+
+    # интересует переход из "left/kicked" в "member/administrator"
+    if old in ("left", "kicked") and new in ("member", "administrator"):
+        user = chat_member_update.new_chat_member.user
+        now_iso = datetime.utcnow().isoformat()
+
+        sheet = get_sheet()
+        set_joined_at(sheet, user.id, user.username, now_iso)
+        print(f"User {user.id} joined the channel at {now_iso}")
+
+
+# ---------------- КОМАНДЫ БОТА ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -69,7 +172,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Здесь вы можете получить персональный промокод на скидку.\n\n"
         "1️⃣ Подпишитесь на наш канал:\n"
         f"https://t.me/{CHANNEL_ID.lstrip('@')}\n\n"
-        "2️⃣ После подписки нажмите /check, и бот проверит подписку и выдаст код."
+        "2️⃣ После подписки нажмите /check, и бот проверит подписку и выдаст код.\n\n"
+        "Промокод выдаётся только новым подписчикам в течение 24 часов после подписки."
     )
     await update.message.reply_text(text)
 
@@ -93,38 +197,89 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 2. Работа с Google Sheets
     sheet = get_sheet()
+    now = datetime.utcnow()
 
-    # проверяем, выдавался ли код ранее
-    if get_user_exists(sheet, user_id):
+    # 2. Смотрим, есть ли пользователь в таблице
+    info = find_user_row(sheet, user_id)
+
+    # ---- СЛУЧАЙ: пользователя ещё нет в таблице ----
+    if not info:
+        # Если он сейчас подписан, но у нас нет joined_at, считаем его СТАРЫМ подписчиком
         await update.message.reply_text(
-            "Вы уже подписаны на канал. Следите за акциями и скидками! 😉"
+            "Вы уже подписаны на канал. "
+            "Промокод действует только для новых подписчиков в течение первых 24 часов после подписки. 😉"
+        )
+        # на всякий случай добавим его без кода, чтобы в будущем не считать новым
+        set_joined_at(sheet, user_id, user.username, "")
+        return
+
+    # ---- СЛУЧАЙ: есть запись в таблице ----
+
+    # если код уже есть — просто напоминаем, что он уже получал/а акцию
+    if info["code"]:
+        await update.message.reply_text(
+            "Вы уже получали персональный промокод. "
+            "Следите за акциями и скидками в нашем канале! 😉"
         )
         return
 
-    # 3. Новый пользователь → генерируем код, записываем в таблицу, отправляем
+    # если нет joined_at — считаем старым подписчиком (подписка была до старта отслеживания)
+    if not info["joined_at"]:
+        await update.message.reply_text(
+            "Вы уже подписаны на канал. "
+            "Промокод доступен только для новых подписчиков в течение 24 часов после подписки."
+        )
+        return
+
+    # есть joined_at, считаем окно
+    try:
+        joined_at = datetime.fromisoformat(info["joined_at"])
+    except ValueError:
+        # если кривой формат, на всякий случай считаем старым подписчиком
+        await update.message.reply_text(
+            "Вы уже подписаны на канал. "
+            "Промокод доступен только для новых подписчиков в течение 24 часов после подписки."
+        )
+        return
+
+    if now - joined_at > timedelta(hours=PROMO_WINDOW_HOURS):
+        # подписка старше 24 часов → код не выдаём
+        await update.message.reply_text(
+            "Промокод доступен только в течение 24 часов после подписки на канал. "
+            "Следите за новыми акциями и скидками! 😊"
+        )
+        return
+
+    # Всё ок: подписка не старше 24 часов, кода ещё не было → выдаём код
     code = generate_code()
-    append_user(sheet, user_id, user.username, code)
+    now_iso = now.isoformat()
+    set_code(sheet, user_id, code, now_iso)
 
     await update.message.reply_text(
-        "Отлично! Вы подписаны на канал 🎉\n\n"
+        "Отлично! Вы подписаны на канал и попадаете в акцию 🎉\n\n"
         f"Ваш персональный промокод на скидку:\n\n"
         f"👉 {code} 👈\n\n"
         "Сообщите его менеджеру при оформлении заказа."
     )
 
 
+# ---------------- ЗАПУСК ПРИЛОЖЕНИЯ ----------------
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check))
 
+    # отслеживание новых подписчиков в канале
+    app.add_handler(ChatMemberHandler(track_subscription, ChatMemberHandler.CHAT_MEMBER))
+
     print("Бот запущен...")
-    # В v20 run_polling СИНХРОННЫЙ и сам управляет event loop
     app.run_polling()
 
 
